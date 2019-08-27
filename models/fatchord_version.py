@@ -85,11 +85,38 @@ class UpsampleNetwork(nn.Module):
         m = m.squeeze(1)[:, :, self.indent:-self.indent]
         return m.transpose(1, 2), aux.transpose(1, 2)
 
+class AdaptNet(nn.Module):
+
+    def __init__(self, num_inputs,
+                 fc_size=64, rnn_size=512):
+        super().__init__()
+        self.fc_size = fc_size
+        self.rnn_size = rnn_size
+        self.nnet = nn.Sequential(
+            nn.Conv1d(num_inputs, num_inputs, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(num_inputs, fc_size, 1),
+            nn.ReLU(inplace=True)
+        )
+        self.rnn = nn.GRU(fc_size, rnn_size, batch_first=True)
+        self.out_proj = nn.Conv1d(rnn_size, num_inputs, 1)
+
+    def forward(self, x, trg=None):
+        src = torch.mean(x, dim=2, keepdim=True)
+        x = self.nnet(x - src)
+        if trg is None:
+            trg = src
+        else:
+            trg = torch.mean(trg, dim=2, keepdim=True)
+        x, _ = self.rnn(x.transpose(1, 2))
+        y = self.out_proj(x.transpose(1, 2))
+        y = y + trg
+        return y
 
 class WaveRNN(nn.Module):
     def __init__(self, rnn_dims, fc_dims, bits, pad, upsample_factors,
                  feat_dims, compute_dims, res_out_dims, res_blocks,
-                 hop_length, sample_rate, mode='RAW'):
+                 hop_length, sample_rate, adaptnet=False, mode='RAW'):
         super().__init__()
         self.mode = mode
         self.pad = pad
@@ -105,6 +132,8 @@ class WaveRNN(nn.Module):
         self.hop_length = hop_length
         self.sample_rate = sample_rate
 
+        if adaptnet:
+            self.adaptnet = AdaptNet(feat_dims)
         self.upsample = UpsampleNetwork(feat_dims, upsample_factors, compute_dims, res_blocks, res_out_dims, pad)
         self.I = nn.Linear(feat_dims + self.aux_dims + 1, rnn_dims)
         self.rnn1 = nn.GRU(rnn_dims, rnn_dims, batch_first=True)
@@ -116,13 +145,15 @@ class WaveRNN(nn.Module):
         self.step = nn.Parameter(torch.zeros(1).long(), requires_grad=False)
         self.num_params()
 
-    def forward(self, x, mels):
+    def forward(self, x, mels, trg_mel=None):
         device = next(self.parameters()).device  # use same device as parameters
         
         self.step += 1
         bsize = x.size(0)
         h1 = torch.zeros(1, bsize, self.rnn_dims, device=device)
         h2 = torch.zeros(1, bsize, self.rnn_dims, device=device)
+        if hasattr(self, 'adaptnet'):
+            mels = self.adaptnet(mels, trg=trg_mel)
         mels, aux = self.upsample(mels)
 
         aux_idx = [self.aux_dims * i for i in range(5)]
@@ -149,7 +180,8 @@ class WaveRNN(nn.Module):
         x = F.relu(self.fc2(x))
         return self.fc3(x)
 
-    def generate(self, mels, save_path, batched, target, overlap, mu_law):
+    def generate(self, mels, save_path, batched, target, overlap, mu_law,
+                 trg_mel=None):
         device = next(self.parameters()).device  # use same device as parameters
 
         mu_law = mu_law if self.mode == 'RAW' else False
@@ -165,7 +197,10 @@ class WaveRNN(nn.Module):
             mels = torch.as_tensor(mels, device=device)
             wave_len = (mels.size(-1) - 1) * self.hop_length
             mels = self.pad_tensor(mels.transpose(1, 2), pad=self.pad, side='both')
-            mels, aux = self.upsample(mels.transpose(1, 2))
+            mels = mels.transpose(1, 2)
+            if trg_mel is not None and hasattr(self, 'adaptnet'):
+                mels = self.adaptnet(mels, trg_mel)
+            mels, aux = self.upsample(mels)
 
             if batched:
                 mels = self.fold_with_overlap(mels, target, overlap)
@@ -220,7 +255,7 @@ class WaveRNN(nn.Module):
                 else:
                     raise RuntimeError("Unknown model mode value - ", self.mode)
 
-                if i % 100 == 0: self.gen_display(i, seq_len, b_size, start)
+                #if i % 100 == 0: self.gen_display(i, seq_len, b_size, start)
 
         output = torch.stack(output).transpose(0, 1)
         output = output.cpu().numpy()

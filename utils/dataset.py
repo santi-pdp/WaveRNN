@@ -1,12 +1,14 @@
 import pickle
 import random
+import soundfile as sf
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import Sampler
 from utils.dsp import *
 import hparams as hp
 from utils.text import text_to_sequence
-
+import random
+random.seed(1)
 
 ###################################################################################
 # WaveRNN/Vocoder Dataset #########################################################
@@ -14,28 +16,88 @@ from utils.text import text_to_sequence
 
 
 class VocoderDataset(Dataset):
-    def __init__(self, ids, path, train_gta=False):
+    def __init__(self, ids, path, uttnames, 
+                 transforms=None, train_gta=False,
+                 test=False):
         self.metadata = ids
+        self.uttnames = uttnames
+        assert len(self.uttnames) == len(ids)
         self.mel_path = f'{path}gta/' if train_gta else f'{path}mel/'
         self.quant_path = f'{path}quant/'
-
+        self.transforms = transforms
+        self.test = test
 
     def __getitem__(self, index):
         id = self.metadata[index]
+        uttname = self.uttnames[index]
+        wav, rate = sf.read(uttname)
+        # randomly chunk a piece of the wav to make
+        # a neighbor from the same speaker as ID representative
+        ridx = np.random.randint(0, len(wav) - hp.voc_seq_len)
+        neigh_wav = wav[ridx:ridx+hp.voc_seq_len]
         m = np.load(f'{self.mel_path}{id}.npy')
         x = np.load(f'{self.quant_path}{id}.npy')
-        return m, x
+        if not self.test:
+            mel_win = hp.voc_seq_len // hp.hop_length + 2 * hp.voc_pad
+            #max_offsets = [x[0].shape[-1] -2 - (mel_win + 2 * hp.voc_pad) for x in batch]
+            max_offset = m.shape[-1] -2 - (mel_win + 2 * hp.voc_pad)
+            mel_offset = np.random.randint(0, max_offset)
+            sig_offset = (mel_offset + hp.voc_pad) * hp.hop_length 
+            # select random mel window
+            m = torch.tensor(m[:, mel_offset:mel_offset + mel_win]).float()
+            # select random label window (signal level)
+            labels = torch.tensor(x[sig_offset:sig_offset + hp.voc_seq_len + 1]).long()
+        else:
+            m = torch.tensor(m).float()
+        # Create the mel span version in time in case feature extraction
+        # is done on the fly with additional distortions
+        bits = 16 if hp.voc_mode == 'MOL' else hp.bits
+        if self.test:
+            if hp.mu_law and hp.voc_mode != 'MOL':
+                x = decode_mu_law(x, 2 ** bits, from_labels=True)
+            else:
+                x = label_2_float(x, bits)
+            xm = torch.FloatTensor(x) 
+            if self.transforms is not None:
+                xm = self.transforms({'chunk':xm})['chunk'].float()
+                xm = xm / torch.max(torch.abs(xm))
+        else:
+            xm = x[sig_offset:sig_offset + hp.voc_seq_len + (2 * hp.voc_pad * \
+                                                             hp.hop_length)]
+            if hp.mu_law and hp.voc_mode != 'MOL':
+                # decode mu x for xm
+                xm = decode_mu_law(xm, 2 ** bits, from_labels=True)
+            xm = torch.FloatTensor(xm)
+            if self.transforms is not None:
+                xm = self.transforms({'chunk':xm})['chunk'].float()
+                xm = xm / torch.max(torch.abs(xm))
+            x = labels[:hp.voc_seq_len]
+            y = labels[1:]
+            # convert x to float (possibly with mu law)
+            x = label_2_float(x.float(), bits)
+            if hp.voc_mode == 'MOL':
+                y = label_2_float(y.float(), bits)
+
+        if self.test:
+            return m, xm, x, torch.FloatTensor(neigh_wav)
+        else:
+            return m, xm, x, y, torch.FloatTensor(neigh_wav)
 
     def __len__(self):
         return len(self.metadata)
 
 
-def get_vocoder_datasets(path, batch_size, train_gta):
+def get_vocoder_datasets(path, batch_size, train_gta, num_workers=1,
+                         transforms=None):
 
     with open(f'{path}dataset.pkl', 'rb') as f:
         dataset = pickle.load(f)
 
-    dataset_ids = [x[0] for x in dataset]
+    dataset_ids = []
+    dataset_uttnames = []
+    for x in dataset:
+        dataset_ids.append(x[0])
+        dataset_uttnames.append(x[1])
 
     random.seed(1234)
     random.shuffle(dataset_ids)
@@ -43,13 +105,20 @@ def get_vocoder_datasets(path, batch_size, train_gta):
     test_ids = dataset_ids[-hp.voc_test_samples:]
     train_ids = dataset_ids[:-hp.voc_test_samples]
 
-    train_dataset = VocoderDataset(train_ids, path, train_gta)
-    test_dataset = VocoderDataset(test_ids, path, train_gta)
+    test_uttnames = dataset_uttnames[-hp.voc_test_samples:]
+    train_uttnames = dataset_uttnames[:-hp.voc_test_samples]
+
+    train_dataset = VocoderDataset(train_ids, path, train_uttnames,
+                                   transforms=transforms, train_gta=train_gta)
+    test_dataset = VocoderDataset(test_ids, path, test_uttnames, 
+                                  transforms=transforms, 
+                                  train_gta=train_gta,
+                                  test=True)
 
     train_set = DataLoader(train_dataset,
-                           collate_fn=collate_vocoder,
+                           #collate_fn=collate_vocoder,
                            batch_size=batch_size,
-                           num_workers=2,
+                           num_workers=num_workers,
                            shuffle=True,
                            pin_memory=True)
 
@@ -62,33 +131,26 @@ def get_vocoder_datasets(path, batch_size, train_gta):
     return train_set, test_set
 
 
+"""
 def collate_vocoder(batch):
-    mel_win = hp.voc_seq_len // hp.hop_length + 2 * hp.voc_pad
-    max_offsets = [x[0].shape[-1] -2 - (mel_win + 2 * hp.voc_pad) for x in batch]
-    mel_offsets = [np.random.randint(0, offset) for offset in max_offsets]
-    sig_offsets = [(offset + hp.voc_pad) * hp.hop_length for offset in mel_offsets]
+    # raw wavs
+    wavs = [x[2] for x in batch]
+    # build neighbors list too
+    neighs = [x[3] for x in batch]
 
-    mels = [x[0][:, mel_offsets[i]:mel_offsets[i] + mel_win] for i, x in enumerate(batch)]
-
-    labels = [x[1][sig_offsets[i]:sig_offsets[i] + hp.voc_seq_len + 1] for i, x in enumerate(batch)]
 
     mels = np.stack(mels).astype(np.float32)
     labels = np.stack(labels).astype(np.int64)
+    neighs = np.stack(neighs).astype(np.float32)
 
     mels = torch.tensor(mels)
     labels = torch.tensor(labels).long()
+    neighs = torch.tensor(neighs)
 
-    x = labels[:, :hp.voc_seq_len]
-    y = labels[:, 1:]
 
-    bits = 16 if hp.voc_mode == 'MOL' else hp.bits
 
-    x = label_2_float(x.float(), bits)
-
-    if hp.voc_mode == 'MOL':
-        y = label_2_float(y.float(), bits)
-
-    return x, y, mels
+    return x, y, mels, neighs
+"""
 
 
 ###################################################################################
