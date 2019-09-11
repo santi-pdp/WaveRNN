@@ -2,16 +2,13 @@
 # CONFIG -----------------------------------------------------------------------------------------------------------#
 
 #LIBRITTS_ROOT='LibriTTS_calcula'
-LIBRITTS_ROOT='LibriTTS'
+#LIBRITTS_ROOT='LibriTTS'
 
 # Here are the input and output data paths (Note: you can override wav_path in preprocess.py)
-#wav_path = 'data/vctk/all_trimmed_wav16'
-#wav_path = 'data/LibriTTS/all_train_11s-sel_16k'
-wav_path = 'data/{}/all_train_clean_60s-sel_16k'.format(LIBRITTS_ROOT)
-#data_path = 'data/vctk/all_trimmed_paseQRNN'
-#data_path = 'data/LibriTTS/all_train_11s-sel_paseQRNN'
-data_path = 'data/{}/all_train_clean_60s-sel_paseQRNN'.format(LIBRITTS_ROOT)
-#data_path = 'data/LibriTTS_calcula/all_train_11s-sel_paseQRNN'
+wav_path = 'data/GEnhancement/VCTK/'
+#wav_path = 'data/{}/all_train_clean_60s-sel_16k'.format(LIBRITTS_ROOT)
+data_path = 'data/GEnhancement/VCTK/'
+#data_path = 'data/{}/all_train_clean_60s-sel_paseQRNN'.format(LIBRITTS_ROOT)
 num_workers = 30
 
 # model ids are separate - that way you can use a new tts with an old wavernn and vice versa
@@ -19,15 +16,22 @@ num_workers = 30
 #voc_model_id = 'pase-eval_enhancement_libritts_raw'
 #voc_model_id = 'pase-eval-FT_enhancement_libritts_raw'
 #voc_model_id = 'pase-eval_enhancement-addrev_libritts_raw'
-voc_model_id = 'pase-eval_clean_libritts_raw'
-tts_model_id = 'ljspeech_lsa_smooth_attention'
+#voc_model_id = 'LSpase-eval_clean_libritts_raw'
+#voc_model_id = 'LSpase-eval_clean_vctk_raw'
+voc_model_id = 'LSpase-eval-regularized_lambda1_addrev_vctk_raw'
+#voc_model_id = 'LSpase-eval-regularized_lambda1_addrev_libritts_raw'
+#voc_model_id = 'pase-eval_addrev_libritts_raw'
 
+
+
+tts_model_id = 'ljspeech_lsa_smooth_attention'
 # set this to True if you are only interested in WaveRNN
 ignore_tts = True
 
 # distortions configuration file
-distortions_cfg = None
+#distortions_cfg = None
 #distortions_cfg = 'addrev.cfg'
+distortions_cfg = 'addrev_calcula.cfg'
 # ALL distortions active
 #distortions_cfg = 'distortions.cfg'
 #distortions_cfg = 'distortions_calcula.cfg'
@@ -41,10 +45,12 @@ n_fft = 2048
 fft_bins = n_fft // 2 + 1
 #num_mels = 80
 num_mels = 100
-#pase_cfg = 'pase_models/QRNN/PASE_dense_QRNN.cfg'
-#pase_ckpt = 'pase_models/QRNN/PASE_dense_QRNN.ckpt'
-pase_cfg = 'pase_models/QRNN_LibriTTS_5reg/PASE_dense_QRNN.cfg'
-pase_ckpt = 'pase_models/QRNN_LibriTTS_5reg/FE_e4.ckpt'
+pase_cfg = 'pase_models/QRNN/PASE_dense_QRNN.cfg'
+pase_ckpt = 'pase_models/QRNN/PASE_dense_QRNN.ckpt'
+#pase_cfg = 'pase_models/QRNN_LibriTTS_5reg/PASE_dense_QRNN.cfg'
+#pase_ckpt = 'pase_models/QRNN_LibriTTS_5reg/FE_e4.ckpt'
+pase_lambda = 1
+#pase_lambda = 0.
 pase_id_ft = False
 #pase_cntnt_ft = False
 pase_cntnt_ft = True

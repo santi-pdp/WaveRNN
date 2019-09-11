@@ -16,12 +16,13 @@ random.seed(1)
 
 
 class VocoderDataset(Dataset):
-    def __init__(self, ids, path, uttnames, 
+    def __init__(self, ids, path, uttnames=None, 
                  transforms=None, train_gta=False,
                  test=False):
         self.metadata = ids
         self.uttnames = uttnames
-        assert len(self.uttnames) == len(ids)
+        if uttnames is not None:
+            assert len(self.uttnames) == len(ids)
         self.mel_path = f'{path}gta/' if train_gta else f'{path}mel/'
         self.quant_path = f'{path}quant/'
         self.transforms = transforms
@@ -29,12 +30,15 @@ class VocoderDataset(Dataset):
 
     def __getitem__(self, index):
         id = self.metadata[index]
-        uttname = self.uttnames[index]
-        wav, rate = sf.read(uttname)
-        # randomly chunk a piece of the wav to make
-        # a neighbor from the same speaker as ID representative
-        ridx = np.random.randint(0, len(wav) - hp.voc_seq_len)
-        neigh_wav = wav[ridx:ridx+hp.voc_seq_len]
+        if self.uttnames is not None:
+            uttname = self.uttnames[index]
+            wav, rate = sf.read(uttname)
+            # randomly chunk a piece of the wav to make
+            # a neighbor from the same speaker as ID representative
+            ridx = np.random.randint(0, len(wav) - hp.voc_seq_len)
+            neigh_wav = torch.FloatTensor(wav[ridx:ridx+hp.voc_seq_len])
+        else:
+            neigh_wav = torch.zeros(hp.voc_seq_len)
         m = np.load(f'{self.mel_path}{id}.npy')
         x = np.load(f'{self.quant_path}{id}.npy')
         if not self.test:
@@ -60,7 +64,7 @@ class VocoderDataset(Dataset):
             xm = torch.FloatTensor(x) 
             if self.transforms is not None:
                 xm = self.transforms({'chunk':xm})['chunk'].float()
-                xm = xm / torch.max(torch.abs(xm))
+                #xm = xm / torch.max(torch.abs(xm))
         else:
             xm = x[sig_offset:sig_offset + hp.voc_seq_len + (2 * hp.voc_pad * \
                                                              hp.hop_length)]
@@ -70,7 +74,7 @@ class VocoderDataset(Dataset):
             xm = torch.FloatTensor(xm)
             if self.transforms is not None:
                 xm = self.transforms({'chunk':xm})['chunk'].float()
-                xm = xm / torch.max(torch.abs(xm))
+                #xm = xm / torch.max(torch.abs(xm))
             x = labels[:hp.voc_seq_len]
             y = labels[1:]
             # convert x to float (possibly with mu law)
@@ -79,16 +83,16 @@ class VocoderDataset(Dataset):
                 y = label_2_float(y.float(), bits)
 
         if self.test:
-            return m, xm, x, torch.FloatTensor(neigh_wav)
+            return m, xm, x, neigh_wav
         else:
-            return m, xm, x, y, torch.FloatTensor(neigh_wav)
+            return m, xm, x, y, neigh_wav
 
     def __len__(self):
         return len(self.metadata)
 
 
 def get_vocoder_datasets(path, batch_size, train_gta, num_workers=1,
-                         transforms=None):
+                         transforms=None, spk2split=None):
 
     with open(f'{path}dataset.pkl', 'rb') as f:
         dataset = pickle.load(f)
@@ -96,24 +100,59 @@ def get_vocoder_datasets(path, batch_size, train_gta, num_workers=1,
     dataset_ids = []
     dataset_uttnames = []
     for x in dataset:
-        dataset_ids.append(x[0])
-        dataset_uttnames.append(x[1])
+        if len(x) == 3:
+            dataset_ids.append(x[0])
+            dataset_uttnames.append(x[1])
+        else:
+            assert len(x) == 2
+            dataset_ids.append(x[0])
+            dataset_uttnames = None
 
     random.seed(1234)
     random.shuffle(dataset_ids)
 
-    test_ids = dataset_ids[-hp.voc_test_samples:]
-    train_ids = dataset_ids[:-hp.voc_test_samples]
+    print(dataset_ids[:5])
+    if spk2split is None:
+        test_ids = dataset_ids[-hp.voc_test_samples:]
+        train_ids = dataset_ids[:-hp.voc_test_samples]
+        if dataset_uttnames is not None:
+            test_uttnames = dataset_uttnames[-hp.voc_test_samples:]
+            train_uttnames = dataset_uttnames[:-hp.voc_test_samples]
+        else:
+            test_uttnames = train_uttnames = None
+        valid_ids = None
+    else:
+        # map each id to the diff split
+        splits = {'id':{'train':[], 'valid':[], 'test':[]},
+                  'uttname':{'train':[], 'valid':[], 'test':[]}}
+        for idi, id_ in enumerate(dataset_ids):
+            spkid = id_.split('_')[0]
+            splits['id'][spk2split[spkid]].append(id_)
+            if dataset_uttnames is not None:
+                uttname = dataset_uttnames[idi]
+                splits['uttname'][spk2split[spkid]].append(uttname)
 
-    test_uttnames = dataset_uttnames[-hp.voc_test_samples:]
-    train_uttnames = dataset_uttnames[:-hp.voc_test_samples]
+        train_ids = splits['id']['train']
+        test_ids = splits['id']['test']
+        valid_ids = splits['id']['valid']
+        if dataset_uttnames is not None:
+            train_uttnames = splits['uttname']['train']
+            test_uttnames = splits['uttname']['test']
+            valid_uttnames = splits['uttname']['valid']
+        else:
+            train_uttnames = test_uttnames = valid_uttnames = None
+
 
     train_dataset = VocoderDataset(train_ids, path, train_uttnames,
                                    transforms=transforms, train_gta=train_gta)
+
     test_dataset = VocoderDataset(test_ids, path, test_uttnames, 
                                   transforms=transforms, 
                                   train_gta=train_gta,
                                   test=True)
+    if valid_ids is not None:
+        valid_dataset = VocoderDataset(valid_ids, path, valid_uttnames,
+                                       transforms=transforms, train_gta=train_gta)
 
     train_set = DataLoader(train_dataset,
                            #collate_fn=collate_vocoder,
@@ -127,8 +166,16 @@ def get_vocoder_datasets(path, batch_size, train_gta, num_workers=1,
                           num_workers=1,
                           shuffle=False,
                           pin_memory=True)
+    if valid_ids is not None:
+        valid_set = DataLoader(valid_dataset,
+                               batch_size=batch_size,
+                               num_workers=num_workers,
+                               shuffle=False,
+                               pin_memory=True)
+    else:
+        valid_set = None
 
-    return train_set, test_set
+    return train_set, test_set, valid_set
 
 
 """

@@ -9,7 +9,7 @@ import argparse
 
 
 def gen_testset(model, test_set, samples, batched, target, overlap, save_path,
-                device='cpu'):
+                hp=None, device='cpu'):
 
     k = model.get_step() // 1000
     trg = None
@@ -110,7 +110,7 @@ if __name__ == "__main__":
     parser.add_argument('--samples', '-s', type=int, help='[int] number of utterances to generate')
     parser.add_argument('--target', '-t', type=int, help='[int] number of samples in each batch index')
     parser.add_argument('--overlap', '-o', type=int, help='[int] number of crossover samples')
-    parser.add_argument('--file', '-f', type=str, help='[string/path] for '
+    parser.add_argument('--file', '-f', type=str, nargs='+', help='[string/path] for '
                         'testing a wav outside dataset', default=None)
     parser.add_argument('--conversion_ref', '-k', type=str, help='[string/path] for testing a wav outside dataset')
     parser.add_argument('--weights', '-w', type=str, help='[string/path] checkpoint file to load weights from')
@@ -199,10 +199,11 @@ if __name__ == "__main__":
     else:
         hp.pase_id = hp.pase_cntnt = None
         pase_id = pase_cntnt = None
-    if file:
-        gen_from_file(model, file, paths.voc_output, batched, target, overlap,
-                      pase_cntnt=pase_cntnt, pase_id=pase_id, 
-                      conversion_ref=args.conversion_ref, device=device)
+    if file is not None:
+        for f in file:
+            gen_from_file(model, f, paths.voc_output, batched, target, overlap,
+                          pase_cntnt=pase_cntnt, pase_id=pase_id, 
+                          conversion_ref=args.conversion_ref, device=device)
     else:
         gen_testset(model, test_set, samples, batched, target, overlap,
                     paths.voc_output, device=device)
