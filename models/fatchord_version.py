@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pase.models.frontend import wf_builder
+from pase.models.modules import Saver
 from utils.distribution import sample_from_discretized_mix_logistic
 from utils.display import *
 from utils.dsp import *
@@ -81,7 +83,8 @@ class UpsampleNetwork(nn.Module):
         aux = self.resnet_stretch(aux)
         aux = aux.squeeze(1)
         m = m.unsqueeze(1)
-        for f in self.up_layers: m = f(m)
+        for f in self.up_layers: 
+            m = f(m)
         m = m.squeeze(1)[:, :, self.indent:-self.indent]
         return m.transpose(1, 2), aux.transpose(1, 2)
 
@@ -112,6 +115,49 @@ class AdaptNet(nn.Module):
         y = self.out_proj(x.transpose(1, 2))
         y = y + trg
         return y
+
+class PASEInjector(nn.Module):
+
+    def __init__(self, pase_cfg, pase_ckpt, pase_ft,
+                 num_inputs,
+                 pase_feats,
+                 save_path,
+                 global_mode=False):
+        super().__init__()
+        self.pase = wf_builder(pase_cfg)
+        if pase_ckpt is not None:
+            self.pase.load_pretrained(pase_ckpt, load_last=True, verbose=True)
+        if num_inputs != pase_feats:
+            # make a projector
+            self.pase_W = nn.Conv1d(num_inputs, pase_feats, 1)
+        self.global_mode = global_mode 
+        if pase_ft:
+            self.pase.saver = Saver(self.pase, save_path,
+                                    prefix='PASE')
+            self.pase.train()
+        else:
+            self.pase.eval()
+
+    def forward(self, x, global_x=None):
+        if self.global_mode:
+            assert global_x is not None
+        m = self.pase(x)
+        if self.global_mode:
+            # concat the global summary
+            gl = self.pase(global_x)
+            gl = torch.mean(gl, dim=2, keepdim=True)
+            gl = gl.repeat(1, 1, m.shape[2])
+            m = torch.cat((m, gl), dim=1)
+        if hasattr(self, 'pase_W'):
+            m = self.pase_W(m)
+        return m
+
+    def save(self, save_path, step):
+        self.pase.save(save_path, step)
+
+    def parameters(self):
+        return self.pase.parameters()
+        
 
 class WaveRNN(nn.Module):
     def __init__(self, rnn_dims, fc_dims, bits, pad, upsample_factors,
@@ -152,8 +198,6 @@ class WaveRNN(nn.Module):
         bsize = x.size(0)
         h1 = torch.zeros(1, bsize, self.rnn_dims, device=device)
         h2 = torch.zeros(1, bsize, self.rnn_dims, device=device)
-        if hasattr(self, 'adaptnet'):
-            mels = self.adaptnet(mels, trg=trg_mel)
         mels, aux = self.upsample(mels)
 
         aux_idx = [self.aux_dims * i for i in range(5)]

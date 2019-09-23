@@ -1,11 +1,13 @@
 import pickle
 import random
+import glob
+import os
 import soundfile as sf
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import Sampler
 from utils.dsp import *
-import hparams as hp
+#import hparams as hp
 from utils.text import text_to_sequence
 import random
 random.seed(1)
@@ -14,6 +16,111 @@ random.seed(1)
 # WaveRNN/Vocoder Dataset #########################################################
 ###################################################################################
 
+class GEnhancementDataset(Dataset):
+
+    def __init__(self, clean, noisy, hp, test=False):
+        super().__init__()
+        self.clean_wavs = glob.glob(os.path.join(clean, '*.wav'))
+        if len(self.clean_wavs) == 0:
+            raise ValueError('No clean wavs found')
+        self.noisy = noisy
+        self.hp = hp
+        self.test = test
+
+    def discretize(self, x):
+        hp = self.hp
+        if hp.voc_mode == 'RAW':
+            x = encode_mu_law(x, mu=2 ** hp.bits) if hp.mu_law else \
+                    float_2_label(x, bits=hp.bits)
+        elif hp.voc_mode == 'MOL':
+            x = float_2_label(x, bits=16)
+        x = x.astype(np.int64)
+        return x
+
+    def __getitem__(self, index):
+        hp = self.hp
+        # pick clean file
+        cfile = self.clean_wavs[index]
+        cwav, rate = sf.read(cfile)
+        # pick corresponding noisy
+        bname = os.path.basename(cfile)
+        nfile = os.path.join(self.noisy, bname)
+        nwav , rate = sf.read(nfile)
+        assert len(nwav) == len(cwav)
+        y = self.discretize(cwav)
+        # chunk
+        if not self.test:
+            mel_win = hp.voc_seq_len // hp.hop_length + 2 * hp.voc_pad
+            T = len(nwav) // hp.hop_length
+            max_offset = T -2 - (mel_win + 2 * hp.voc_pad)
+            mel_offset = np.random.randint(0, max_offset)
+            sig_offset = (mel_offset + hp.voc_pad) * hp.hop_length 
+            # select random signal window
+            m = torch.FloatTensor(nwav[sig_offset:sig_offset + mel_win * hp.hop_length])
+            if len(nwav) < hp.context_size:
+                P_ = hp.context_size - len(nwav)
+                nwav = np.concatenate((nwav, np.zeros(P_,)), axis=0)
+                longidx = 0
+            elif len(nwav) == hp.context_size:
+                longidx = 0
+            else:
+                longidx = np.random.randint(0, len(nwav) - hp.context_size)
+            longm = torch.FloatTensor(nwav[longidx:longidx + hp.context_size])
+            lab = torch.tensor(y[sig_offset:sig_offset + hp.voc_seq_len + 1]).long()
+            # AR input and output
+            x = lab[:hp.voc_seq_len]
+            y = lab[1:]
+            # convert x to float (possibly with mu law)
+            x = label_2_float(x.float(), hp.bits)
+            if hp.voc_mode == 'MOL':
+                y = label_2_float(y.float(), hp.bits)
+            return x, y, m, longm
+        else:
+            bits = 16 if hp.voc_mode == 'MOL' else hp.bits
+            x = y
+            if hp.mu_law and hp.voc_mode != 'MOL':
+                x = decode_mu_law(x, 2 ** bits, from_labels=True)
+            else:
+                x = label_2_float(x, bits)
+            xm = torch.FloatTensor(nwav) 
+            xlm = torch.FloatTensor(nwav)
+            return x, xm, xlm
+
+    def __len__(self):
+        return len(self.clean_wavs)
+
+
+def get_genh_datasets(train_clean, train_noisy, valid_clean, valid_noisy,
+                      test_clean, test_noisy, batch_size, hparams, 
+                      num_workers=1):
+
+
+    train_dataset = GEnhancementDataset(train_clean, train_noisy, hparams)
+
+    valid_dataset = GEnhancementDataset(valid_clean, valid_noisy, hparams)
+
+    test_dataset = GEnhancementDataset(test_clean, test_noisy, hparams,
+                                       test=True)
+
+    train_set = DataLoader(train_dataset,
+                           batch_size=batch_size,
+                           num_workers=num_workers,
+                           shuffle=True,
+                           pin_memory=True)
+
+    test_set = DataLoader(test_dataset,
+                          batch_size=1,
+                          num_workers=1,
+                          shuffle=False,
+                          pin_memory=True)
+
+    valid_set = DataLoader(valid_dataset,
+                           batch_size=batch_size,
+                           num_workers=num_workers,
+                           shuffle=False,
+                           pin_memory=True)
+
+    return train_set, valid_set, test_set
 
 class VocoderDataset(Dataset):
     def __init__(self, ids, path, uttnames=None, 

@@ -8,6 +8,34 @@ import torch
 import argparse
 
 
+def gen_genh_testset(model, test_set, samples, batched, target, overlap, save_path,
+                     hp=None, device='cpu'):
+
+    k = model.get_step() // 1000
+    trg = None
+    hp.pase.eval()
+
+    for i, (x, xm, xlm) in enumerate(test_set, 1):
+
+        if i > samples: break
+
+        print('\n| Generating: %i/%i' % (i, samples))
+        x = x[0].numpy()
+        xm = xm.unsqueeze(1).to(device)
+        xlm = xlm.unsqueeze(1).to(device)
+        with torch.no_grad():
+            m = hp.pase(xm, xlm)
+        xm = xm[0, 0].cpu().data.numpy()
+
+        save_wav(x, f'{save_path}{k}k_steps_{i}_target.wav')
+        save_wav(xm, f'{save_path}{k}k_steps_{i}_xm.wav')
+
+        batch_str = f'gen_batched_target{target}_overlap{overlap}' if batched else 'gen_NOT_BATCHED'
+        save_str = f'{save_path}{k}k_steps_{i}_{batch_str}.wav'
+
+
+        _ = model.generate(m, save_str, batched, target, overlap, hp.mu_law)
+
 def gen_testset(model, test_set, samples, batched, target, overlap, save_path,
                 hp=None, device='cpu'):
 

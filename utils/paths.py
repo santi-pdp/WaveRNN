@@ -36,3 +36,18 @@ class Paths:
         os.makedirs(self.tts_attention, exist_ok=True)
         os.makedirs(self.tts_mel_plot, exist_ok=True)
 
+
+class GEnhancementPaths:
+
+    def __init__(self, voc_id):
+        # WaveRNN/Vocoder Paths
+        self.voc_checkpoints = f'checkpoints/{voc_id}.wavernn/'
+        self.voc_latest_weights = f'{self.voc_checkpoints}latest_weights.pyt'
+        self.voc_output = f'model_outputs/{voc_id}.wavernn/'
+        self.voc_step = f'{self.voc_checkpoints}/step.npy'
+        self.voc_log = f'{self.voc_checkpoints}log.txt'
+        self.create_paths()
+
+    def create_paths(self):
+        os.makedirs(self.voc_checkpoints, exist_ok=True)
+        os.makedirs(self.voc_output, exist_ok=True)
