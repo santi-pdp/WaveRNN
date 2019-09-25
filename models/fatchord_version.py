@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pase.models.frontend import wf_builder
-from pase.models.modules import Saver
+from pase.models.modules import Saver, Model
 from utils.distribution import sample_from_discretized_mix_logistic
 from utils.display import *
 from utils.dsp import *
@@ -116,14 +116,15 @@ class AdaptNet(nn.Module):
         y = y + trg
         return y
 
-class PASEInjector(nn.Module):
+class PASEInjector(Model):
 
     def __init__(self, pase_cfg, pase_ckpt, pase_ft,
                  num_inputs,
                  pase_feats,
                  save_path,
-                 global_mode=False):
-        super().__init__()
+                 global_mode=False,
+                 name='PASEInjector'):
+        super().__init__(name=name)
         self.pase = wf_builder(pase_cfg)
         if pase_ckpt is not None:
             self.pase.load_pretrained(pase_ckpt, load_last=True, verbose=True)
@@ -132,17 +133,19 @@ class PASEInjector(nn.Module):
             self.pase_W = nn.Conv1d(num_inputs, pase_feats, 1)
         self.global_mode = global_mode 
         if pase_ft:
-            self.pase.saver = Saver(self.pase, save_path,
-                                    prefix='PASE')
+            #self.saver = Saver(self, save_path,
+            #                   prefix='PASE')
             self.pase.train()
         else:
             self.pase.eval()
 
     def forward(self, x, global_x=None):
-        if self.global_mode:
-            assert global_x is not None
+        #if self.global_mode:
+        #    assert global_x is not None
         m = self.pase(x)
         if self.global_mode:
+            if global_x is None:
+                global_x = x
             # concat the global summary
             gl = self.pase(global_x)
             gl = torch.mean(gl, dim=2, keepdim=True)
@@ -152,11 +155,15 @@ class PASEInjector(nn.Module):
             m = self.pase_W(m)
         return m
 
-    def save(self, save_path, step):
-        self.pase.save(save_path, step)
+    #def save(self, save_path, step):
+    #    self.pase.save(save_path, step)
 
-    def parameters(self):
-        return self.pase.parameters()
+    #def load_pretrained(self, pase_ckpt):
+    #    self.pase.load_pretrained(pase_ckpt, load_last=True,
+    #                              verbose=True)
+
+    #def parameters(self):
+    #    return self.pase.parameters()
         
 
 class WaveRNN(nn.Module):

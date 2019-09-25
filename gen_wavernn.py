@@ -1,7 +1,9 @@
 from utils.dataset import get_vocoder_datasets
 from utils.dsp import *
-from models.fatchord_version import WaveRNN
-from utils.paths import Paths
+from models.fatchord_version import WaveRNN, PASEInjector
+from utils.paths import GEnhancementPaths
+import soundfile as sf
+from utils.hparams import *
 from pase.models.frontend import wf_builder
 from utils.display import simple_table
 import torch
@@ -71,6 +73,33 @@ def gen_testset(model, test_set, samples, batched, target, overlap, save_path,
 
         _ = model.generate(m, save_str, batched, target, overlap, hp.mu_law,
                            trg_mel=trg)
+
+def gen_genh_from_file(model, load_path, save_path, batched, target, overlap, 
+                       hp=None, device='cpu'):
+
+    k = model.get_step() // 1000
+    file_name = load_path.split('/')[-1]
+    hp.pase.eval()
+
+    #wav = load_wav(load_path)
+    wav, rate = sf.read(load_path)
+    save_wav(wav, f'{save_path}__{file_name}__{k}k_steps_target.wav')
+
+    if hp.pase is not None:
+        wav = torch.FloatTensor(wav).view(1, 1, -1)
+        wav = wav.to(device)
+        #wav = wav / torch.max(torch.abs(wav))
+        with torch.no_grad():
+            mel = pase(wav)
+        wav = wav.cpu().squeeze().data.numpy()
+    else:
+        mel = melspectrogram(wav)
+        mel = torch.tensor(mel).unsqueeze(0)
+
+    batch_str = f'gen_batched_target{target}_overlap{overlap}' if batched else 'gen_NOT_BATCHED'
+    save_str = f'{save_path}__{file_name}__{k}k_steps_{batch_str}.wav'
+
+    _ = model.generate(mel, save_str, batched, target, overlap, hp.mu_law)
 
 
 def gen_from_file(model, load_path, save_path, batched, target, overlap,
@@ -144,11 +173,10 @@ if __name__ == "__main__":
     parser.add_argument('--weights', '-w', type=str, help='[string/path] checkpoint file to load weights from')
     parser.add_argument('--gta', '-g', dest='use_gta', action='store_true', help='Generate from GTA testset')
     parser.add_argument('--force_cpu', '-c', action='store_true', help='Forces CPU-only training, even when in CUDA capable environment')
+    parser.add_argument('--hparams', type=str, default=None)
     parser.add_argument('--pase_cfg', type=str, help='[string/path] checkpoint file to load weights from',
                         default=None)
-    parser.add_argument('--pase_cntnt_ckpt', type=str, help='[string/path] checkpoint file to load weights from',
-                        default=None)
-    parser.add_argument('--pase_id_ckpt', type=str, help='[string/path] checkpoint file to load weights from',
+    parser.add_argument('--pase_ckpt', type=str, help='[string/path] checkpoint file to load weights from',
                         default=None)
 
     parser.set_defaults(batched=hp.voc_gen_batched)
@@ -160,6 +188,8 @@ if __name__ == "__main__":
     parser.set_defaults(gta=False)
 
     args = parser.parse_args()
+
+    hp = HParams(args.hparams)
 
     batched = args.batched
     samples = args.samples
@@ -176,25 +206,22 @@ if __name__ == "__main__":
 
     print('\nInitialising Model...\n')
 
-    adaptnet = hp.conversion_mode == 1
-    conversion = (not hp.conversion_mode == 2)
-
     model = WaveRNN(rnn_dims=hp.voc_rnn_dims,
                     fc_dims=hp.voc_fc_dims,
                     bits=hp.bits,
                     pad=hp.voc_pad,
                     upsample_factors=hp.voc_upsample_factors,
-                    feat_dims=hp.num_mels,
+                    feat_dims=hp.pase_feats,
                     compute_dims=hp.voc_compute_dims,
                     res_out_dims=hp.voc_res_out_dims,
                     res_blocks=hp.voc_res_blocks,
                     hop_length=hp.hop_length,
                     sample_rate=hp.sample_rate,
-                    adaptnet=adaptnet,
                     mode=hp.voc_mode).to(device)
 
 
-    paths = Paths(hp.data_path, hp.voc_model_id, hp.tts_model_id)
+    #paths = Paths(hp.data_path, hp.voc_model_id, hp.tts_model_id)
+    paths = GEnhancementPaths(hp.voc_model_id)
 
     restore_path = args.weights if args.weights else paths.voc_latest_weights
 
@@ -204,11 +231,13 @@ if __name__ == "__main__":
                   ('Target Samples', target if batched else 'N/A'),
                   ('Overlap Samples', overlap if batched else 'N/A')])
 
-    _, test_set = get_vocoder_datasets(paths.data, 1, gta)
+    assert args.file is not None
+    #_, test_set = get_vocoder_datasets(paths.data, 1, gta)
 
     # Load pase model
     print('Building PASE...')
     if args.pase_cfg is not None:
+        """
         # 2 PASEs: (1) Identifier extractor, (2) Content extractor
         pase_cntnt = wf_builder(args.pase_cfg)
         pase_cntnt.load_pretrained(args.pase_cntnt_ckpt, load_last=True, verbose=True)
@@ -224,14 +253,25 @@ if __name__ == "__main__":
         if conversion:
             pase_id.eval()
             hp.pase_id = pase_id
+        """
+        pase = PASEInjector(args.pase_cfg, None, False,
+                            hp.num_mels, hp.pase_feats,
+                            paths.voc_checkpoints, global_mode=hp.global_pase)
+        pase.load_pretrained(args.pase_ckpt, load_last=True, verbose=True)
+        pase.to(device)
+        hp.pase = pase
+        hp.pase.eval()
     else:
-        hp.pase_id = hp.pase_cntnt = None
-        pase_id = pase_cntnt = None
+        hp.pase = None
+        #hp.pase_id = hp.pase_cntnt = None
+        #pase_id = pase_cntnt = None
     if file is not None:
         for f in file:
-            gen_from_file(model, f, paths.voc_output, batched, target, overlap,
-                          pase_cntnt=pase_cntnt, pase_id=pase_id, 
-                          conversion_ref=args.conversion_ref, device=device)
+            #gen_from_file(model, f, paths.voc_output, batched, target, overlap,
+            #              pase_cntnt=pase_cntnt, pase_id=pase_id, 
+            #              conversion_ref=args.conversion_ref, device=device)
+            gen_genh_from_file(model, f, paths.voc_output, batched, target,
+                               overlap, hp=hp, device=device)
     else:
         gen_testset(model, test_set, samples, batched, target, overlap,
                     paths.voc_output, device=device)
