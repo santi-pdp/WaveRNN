@@ -1,5 +1,6 @@
 import pickle
 import random
+import tqdm
 import glob
 import os
 import soundfile as sf
@@ -15,6 +16,102 @@ random.seed(1)
 ###################################################################################
 # WaveRNN/Vocoder Dataset #########################################################
 ###################################################################################
+
+
+class GEnhancementOnlineDataset(Dataset):
+    
+    def __init__(self, data_root, hp, transform, cache=False,
+                 test=None):
+        super().__init__()
+        self.cache = cache
+        self.wavs = glob.glob(os.path.join(data_root, '*.wav'))
+        if len(self.wavs) == 0:
+            raise ValueError('No wavs found in {}'.format(data_root))
+        if cache:
+            self.data = []
+            for wfile in tqdm.tqdm(self.wavs, total=len(self.wavs)):
+                self.data.append({'wav':sf.read(wfile, dtype='int16')[0],
+                                  'uttname':wfile})
+        self.hp = hp
+        self.test = test
+        self.transform = transform
+
+    def discretize(self, x):
+        hp = self.hp
+        if hp.voc_mode == 'RAW':
+            x = encode_mu_law(x, mu=2 ** hp.bits) if hp.mu_law else \
+                    float_2_label(x, bits=hp.bits)
+        elif hp.voc_mode == 'MOL':
+            x = float_2_label(x, bits=16)
+        x = x.astype(np.int64)
+        return x
+
+    #@profile
+    def __getitem__(self, index):
+        hp = self.hp
+        # pick clean file
+        if hasattr(self, 'data'):
+            cwav = self.data[index]['wav']
+            cfile = self.data[index]['uttname']
+        else:
+            cfile = self.wavs[index]
+            cwav, rate = sf.read(cfile)
+        cwav = cwav.astype(np.float32) / (2 ** 15)
+        # pick corresponding noisy
+        y = self.discretize(cwav)
+        # chunk
+        if not self.test:
+            mel_win = hp.voc_seq_len // hp.hop_length + 2 * hp.voc_pad
+            T = len(cwav) // hp.hop_length
+            max_offset = T -2 - (mel_win + 2 * hp.voc_pad)
+            assert max_offset > 0, max_offset
+            mel_offset = np.random.randint(0, max_offset)
+            sig_offset = (mel_offset + hp.voc_pad) * hp.hop_length 
+            # select random signal window
+            nwav = cwav
+            m = nwav[sig_offset:sig_offset + mel_win * hp.hop_length]
+            pkg = {'chunk':torch.FloatTensor(m), 'uttname':cfile}
+            m = self.transform(pkg)['chunk']
+            if hp.context_size is not None:
+                if len(nwav) < hp.context_size:
+                    P_ = hp.context_size - len(nwav)
+                    nwav = np.concatenate((nwav, np.zeros(P_,)), axis=0)
+                    longidx = 0
+                elif len(nwav) == hp.context_size:
+                    longidx = 0
+                else:
+                    longidx = np.random.randint(0, len(nwav) - hp.context_size)
+                longm = nwav[longidx:longidx + hp.context_size]
+                pkg = {'chunk':torch.FloatTensor(longm), 'uttname':cfile}
+                longm = self.transform(pkg)['chunk']
+                m = (m, longm)
+            lab = torch.tensor(y[sig_offset:sig_offset + hp.voc_seq_len + 1]).long()
+            # AR input and output
+            x = lab[:hp.voc_seq_len]
+            y = lab[1:]
+            # convert x to float (possibly with mu law)
+            x = label_2_float(x.float(), hp.bits)
+            if hp.voc_mode == 'MOL':
+                y = label_2_float(y.float(), hp.bits)
+            return x, y, m
+        else:
+            nwav = self.transform({'chunk':torch.FloatTensor(cwav),
+                                   'uttname':cfile})['chunk']
+            bits = 16 if hp.voc_mode == 'MOL' else hp.bits
+            x = y
+            if hp.mu_law and hp.voc_mode != 'MOL':
+                x = decode_mu_law(x, 2 ** bits, from_labels=True)
+            else:
+                x = label_2_float(x, bits)
+            xm = nwav.float()
+            if hp.context_size is not None:
+                xlm = nwav.float()
+                xm = (xm, xlm)
+            return x, xm
+
+    def __len__(self):
+        return len(self.wavs)
+
 
 class GEnhancementDataset(Dataset):
 
@@ -90,16 +187,25 @@ class GEnhancementDataset(Dataset):
         return len(self.clean_wavs)
 
 
-def get_genh_datasets(train_clean, train_noisy, valid_clean, valid_noisy,
-                      test_clean, test_noisy, batch_size, hparams, 
+#def get_genh_datasets(train_clean, train_noisy, valid_clean, valid_noisy,
+#                      test_clean, test_noisy, batch_size, hparams, 
+#                      num_workers=1):
+def get_genh_datasets(train_clean, valid_clean, 
+                      test_clean, batch_size, hparams, 
+                      transform,
+                      cache,
                       num_workers=1):
 
 
-    train_dataset = GEnhancementDataset(train_clean, train_noisy, hparams)
+    #train_dataset = GEnhancementDataset(train_clean, train_noisy, hparams)
+    train_dataset = GEnhancementOnlineDataset(train_clean, hparams, transform,
+                                              cache=cache)
 
-    valid_dataset = GEnhancementDataset(valid_clean, valid_noisy, hparams)
+    valid_dataset = GEnhancementOnlineDataset(valid_clean, hparams, transform,
+                                        cache=cache)
 
-    test_dataset = GEnhancementDataset(test_clean, test_noisy, hparams,
+    test_dataset = GEnhancementOnlineDataset(test_clean, hparams, transform,
+                                       cache=cache,
                                        test=True)
 
     train_set = DataLoader(train_dataset,
@@ -110,7 +216,7 @@ def get_genh_datasets(train_clean, train_noisy, valid_clean, valid_noisy,
 
     test_set = DataLoader(test_dataset,
                           batch_size=1,
-                          num_workers=1,
+                          num_workers=0,
                           shuffle=False,
                           pin_memory=True)
 
