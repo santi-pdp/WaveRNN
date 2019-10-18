@@ -2,12 +2,15 @@ from utils.dataset import get_vocoder_datasets
 from utils.dsp import *
 from models.fatchord_version import WaveRNN, PASEInjector
 from utils.paths import GEnhancementPaths
+import tqdm
 import soundfile as sf
 from utils.hparams import *
 from pase.models.frontend import wf_builder
 from utils.display import simple_table
 import torch
+import multiprocessing as mp
 import argparse
+import os
 
 
 def gen_genh_testset(model, test_set, samples, batched, target, overlap, save_path,
@@ -17,14 +20,21 @@ def gen_genh_testset(model, test_set, samples, batched, target, overlap, save_pa
     trg = None
     hp.pase.eval()
 
-    for i, (x, xm, xlm) in enumerate(test_set, 1):
+    for i, (x, xm) in enumerate(test_set, 1):
+        if len(xm) == 2:
+            # expand short and long term m
+            xm, xlm = xm
+            xm, xlm = xm.to(device), xlm.to(device)
+            xm = xm.unsqueeze(1)
+            xlm = xlm.unsqueeze(1)
+        else:
+            xm = xm.to(device).unsqueeze(1)
+            xlm = None
 
         if i > samples: break
 
         print('\n| Generating: %i/%i' % (i, samples))
         x = x[0].numpy()
-        xm = xm.unsqueeze(1).to(device)
-        xlm = xlm.unsqueeze(1).to(device)
         with torch.no_grad():
             m = hp.pase(xm, xlm)
         xm = xm[0, 0].cpu().data.numpy()
@@ -74,8 +84,14 @@ def gen_testset(model, test_set, samples, batched, target, overlap, save_path,
         _ = model.generate(m, save_str, batched, target, overlap, hp.mu_law,
                            trg_mel=trg)
 
+def gen_genh_from_file_mp_wrapper(args):
+    model, load_path, save_path, batched, target, overlap, hp, use_basename, \
+            device = args
+    gen_genh_from_file(model, load_path, save_path, batched, target, overlap,
+                       hp, use_basename, device)
+
 def gen_genh_from_file(model, load_path, save_path, batched, target, overlap, 
-                       hp=None, device='cpu'):
+                       hp=None, use_basename=False, device='cpu'):
 
     k = model.get_step() // 1000
     file_name = load_path.split('/')[-1]
@@ -83,7 +99,8 @@ def gen_genh_from_file(model, load_path, save_path, batched, target, overlap,
 
     #wav = load_wav(load_path)
     wav, rate = sf.read(load_path)
-    save_wav(wav, f'{save_path}__{file_name}__{k}k_steps_target.wav')
+    if not use_basename:
+        save_wav(wav, f'{save_path}__{file_name}__{k}k_steps_target.wav')
 
     if hp.pase is not None:
         wav = torch.FloatTensor(wav).view(1, 1, -1)
@@ -96,8 +113,12 @@ def gen_genh_from_file(model, load_path, save_path, batched, target, overlap,
         mel = melspectrogram(wav)
         mel = torch.tensor(mel).unsqueeze(0)
 
-    batch_str = f'gen_batched_target{target}_overlap{overlap}' if batched else 'gen_NOT_BATCHED'
-    save_str = f'{save_path}__{file_name}__{k}k_steps_{batch_str}.wav'
+    if use_basename:
+        basename = os.path.basename(load_path)
+        save_str = f'{save_path}/{basename}'
+    else:
+        batch_str = f'gen_batched_target{target}_overlap{overlap}' if batched else 'gen_NOT_BATCHED'
+        save_str = f'{save_path}__{file_name}__{k}k_steps_{batch_str}.wav'
 
     _ = model.generate(mel, save_str, batched, target, overlap, hp.mu_law)
 
@@ -178,6 +199,10 @@ if __name__ == "__main__":
                         default=None)
     parser.add_argument('--pase_ckpt', type=str, help='[string/path] checkpoint file to load weights from',
                         default=None)
+    parser.add_argument('--save_path', type=str, default=None)
+    parser.add_argument('--use_basename', default=False, action='store_true')
+    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--allowed_files', type=str, default=None)
 
     parser.set_defaults(batched=hp.voc_gen_batched)
     parser.set_defaults(samples=hp.voc_gen_at_checkpoint)
@@ -254,10 +279,10 @@ if __name__ == "__main__":
             pase_id.eval()
             hp.pase_id = pase_id
         """
-        pase = PASEInjector(args.pase_cfg, None, False,
+        pase = PASEInjector(args.pase_cfg, args.pase_ckpt, False,
                             hp.num_mels, hp.pase_feats,
                             paths.voc_checkpoints, global_mode=hp.global_pase)
-        pase.load_pretrained(args.pase_ckpt, load_last=True, verbose=True)
+        #pase.load_pretrained(args.pase_ckpt, load_last=True, verbose=True)
         pase.to(device)
         hp.pase = pase
         hp.pase.eval()
@@ -265,15 +290,38 @@ if __name__ == "__main__":
         hp.pase = None
         #hp.pase_id = hp.pase_cntnt = None
         #pase_id = pase_cntnt = None
+    save_path = paths.voc_output if (args.save_path is None) else args.save_path
+    print('Using save_path: ', save_path)
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
     if file is not None:
-        for f in file:
-            #gen_from_file(model, f, paths.voc_output, batched, target, overlap,
-            #              pase_cntnt=pase_cntnt, pase_id=pase_id, 
-            #              conversion_ref=args.conversion_ref, device=device)
-            gen_genh_from_file(model, f, paths.voc_output, batched, target,
-                               overlap, hp=hp, device=device)
+        if args.allowed_files is not None:
+            # read the list of allowed files
+            with open(args.allowed_files, 'r') as allowed_f:
+                afiles = [l.rstrip() for l in allowed_f]
+            old_num_files = len(file)
+            file = [f for f in file if os.path.basename(f) in afiles]
+            print('Remaining {:5d}/{:5} allowed files from {} filter'
+                  ''.format(len(file), old_num_files, args.allowed_files))
+        if args.num_workers > 0:#and device == 'cpu':
+            print('Using {} workers for parallel CPU '
+                  'inference'.format(args.num_workers))
+            mpargs = [(model, f, save_path, batched, target, \
+                       overlap, hp, args.use_basename, device) for f in file]
+            with mp.Pool(args.num_workers) as pool:
+                for _ in tqdm.tqdm(pool.imap(gen_genh_from_file_mp_wrapper, mpargs),
+                                   total=len(mpargs)):
+                    pass
+        else:
+            for f in tqdm.tqdm(file, total=len(file)):
+                #gen_from_file(model, f, paths.voc_output, batched, target, overlap,
+                #              pase_cntnt=pase_cntnt, pase_id=pase_id, 
+                #              conversion_ref=args.conversion_ref, device=device)
+                gen_genh_from_file(model, f, save_path, batched, target,
+                                   overlap, hp=hp, use_basename=args.use_basename,
+                                   device=device)
     else:
         gen_testset(model, test_set, samples, batched, target, overlap,
-                    paths.voc_output, device=device)
+                    save_path, device=device)
 
     print('\n\nExiting...\n')
