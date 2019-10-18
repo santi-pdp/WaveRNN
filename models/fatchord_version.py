@@ -2,12 +2,57 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pase.models.frontend import wf_builder
-from pase.models.modules import Saver, Model
+from pase.models.modules import Saver, Model, build_rnn_block
 from utils.distribution import sample_from_discretized_mix_logistic
 from utils.display import *
 from utils.dsp import *
 import os
 
+
+class DCRegression(Model):
+
+    def __init__(self, frontend_cfg, num_outputs, 
+                 frontend_ckpt=None, ft_fe=False,
+                 rnn_size=512, rnn_layers=3,
+                 rnn_type='lstm',
+                 cuda=False,
+                 name='DCRegression'):
+        super().__init__(name=name)
+        self.frontend = wf_builder(frontend_cfg)
+        if frontend_ckpt is not None:
+            self.frontend.load_pretrained(frontend_ckpt,
+                                          load_last=True,
+                                          verbose=True)
+        self.ft_fe = ft_fe
+        ninp = self.frontend.emb_dim
+        #self.rnn = nn.LSTM(ninp, rnn_size, rnn_layers,
+        #                   batch_first=True, bidirectional=True)
+        self.rnn = build_rnn_block(ninp, rnn_size, rnn_layers,
+                                   rnn_type, use_cuda=cuda)
+        # Build skip connection adapter
+        self.W = nn.Conv1d(ninp, 2 * rnn_size, 1)
+        self.backend = nn.Sequential(
+            nn.Conv1d(2 * rnn_size, 2 * rnn_size, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(2 * rnn_size, num_outputs, 1)
+        )
+
+    def forward(self, x):
+        if not self.ft_fe:
+            self.frontend.eval()
+            with torch.no_grad():
+                h = self.frontend(x)
+        else:
+            h = self.frontend(x)
+        res = self.W(h)
+        # swap time-feat axes
+        h = h.transpose(1, 2)
+        ht, state = self.rnn(h)
+        # swap time-feat axes back
+        ht = ht.transpose(1, 2)
+        ht = ht + res
+        y = self.backend(ht)
+        return y
 
 class ResBlock(nn.Module):
     def __init__(self, dims):
@@ -123,14 +168,18 @@ class PASEInjector(Model):
                  pase_feats,
                  save_path,
                  global_mode=False,
+                 stft_cfg=None,
+                 stft_ckpt=None,
                  name='PASEInjector'):
         super().__init__(name=name)
         self.pase = wf_builder(pase_cfg)
         if pase_ckpt is not None:
             self.pase.load_pretrained(pase_ckpt, load_last=True, verbose=True)
+        """
         if num_inputs != pase_feats:
             # make a projector
             self.pase_W = nn.Conv1d(num_inputs, pase_feats, 1)
+        """
         self.global_mode = global_mode 
         if pase_ft:
             #self.saver = Saver(self, save_path,
@@ -138,11 +187,22 @@ class PASEInjector(Model):
             self.pase.train()
         else:
             self.pase.eval()
+        if stft_cfg is not None:
+            stft_cfg['frontend_cfg'] = pase_cfg
+            stft_cfg['frontend_ckpt'] = pase_ckpt
+            self.stft_net = DCRegression(**stft_cfg)
+            if stft_ckpt is not None:
+                self.stft_net.load_pretrained(stft_ckpt, 
+                                              load_last=True,
+                                              verbose=True)
 
     def forward(self, x, global_x=None):
         #if self.global_mode:
         #    assert global_x is not None
-        m = self.pase(x)
+        if hasattr(self, 'stft_net'):
+            m = self.stft_net(x)
+        else:
+            m = self.pase(x)
         if self.global_mode:
             if global_x is None:
                 global_x = x
@@ -151,8 +211,10 @@ class PASEInjector(Model):
             gl = torch.mean(gl, dim=2, keepdim=True)
             gl = gl.repeat(1, 1, m.shape[2])
             m = torch.cat((m, gl), dim=1)
+        """
         if hasattr(self, 'pase_W'):
             m = self.pase_W(m)
+        """
         return m
 
     #def save(self, save_path, step):

@@ -20,9 +20,9 @@ from gen_wavernn import gen_genh_testset
 from utils.paths import *
 import json
 import argparse
-import radam
 
 
+#@profile
 def voc_train_loop(model, loss_func, optimiser, train_set, eval_set, test_set,
                    lr, total_steps, device, hp):
 
@@ -42,10 +42,17 @@ def voc_train_loop(model, loss_func, optimiser, train_set, eval_set, test_set,
         running_nll_loss = 0.
         pase_reg_loss = None
 
-        for i, (x, y, xm, xlm) in enumerate(train_set, 1):
-            x, y, xm, xlm = x.to(device), y.to(device), xm.to(device), xlm.to(device)
-            xm = xm.unsqueeze(1)
-            xlm = xlm.unsqueeze(1)
+        for i, (x, y, xm) in enumerate(train_set, 1):
+            if len(xm) == 2:
+                # expand short and long term m
+                xm, xlm = xm
+                xm, xlm = xm.to(device), xlm.to(device)
+                xm = xm.unsqueeze(1)
+                xlm = xlm.unsqueeze(1)
+            else:
+                xm = xm.to(device).unsqueeze(1)
+                xlm = None
+            x, y = x.to(device), y.to(device)
 
             if hp.pase_ft:
                 m = hp.pase(xm, xlm)
@@ -148,10 +155,17 @@ def voc_eval_loop(model, loss_func, eval_set, device):
         running_nll_loss = 0.
         pase_reg_loss = None
 
-        for i, (x, y, xm, xlm) in enumerate(eval_set, 1):
-            x, y, xm, xlm = x.to(device), y.to(device), xm.to(device), xlm.to(device)
-            xm = xm.unsqueeze(1)
-            xlm = xlm.unsqueeze(1)
+        for i, (x, y, xm) in enumerate(eval_set, 1):
+            if len(xm) == 2:
+                # expand short and long term m
+                xm, xlm = xm
+                xm, xlm = xm.to(device), xlm.to(device)
+                xm = xm.unsqueeze(1)
+                xlm = xlm.unsqueeze(1)
+            else:
+                xm = xm.to(device).unsqueeze(1)
+                xlm = None
+            x, y = x.to(device), y.to(device)
 
             m = hp.pase(xm, xlm)
             if hp.pase_lambda > 0:
@@ -221,6 +235,7 @@ if __name__ == "__main__":
     parser.add_argument('--force_cpu', '-c', action='store_true', help='Forces CPU-only training, even when in CUDA capable environment')
     parser.add_argument('--seed', type=int, default=3)
     parser.add_argument('--cfg', type=str, default=None)
+    parser.add_argument('--cache', default=False, action='store_true')
 
     args = parser.parse_args()
     num_workers = args.num_workers
@@ -271,7 +286,8 @@ if __name__ == "__main__":
     if hp.pase_cfg is not None:
         pase = PASEInjector(hp.pase_cfg, hp.pase_ckpt, hp.pase_ft,
                             hp.num_mels, hp.pase_feats,
-                            paths.voc_checkpoints, global_mode=hp.global_pase)
+                            paths.voc_checkpoints, global_mode=hp.global_pase,
+                            stft_cfg=hp.stft_cfg, stft_ckpt=hp.stft_ckpt)
         pase.to(device)
         if hp.pase_ft:
             print('Setting PASE in TRAIN mode')
@@ -290,6 +306,7 @@ if __name__ == "__main__":
 
     optimiser = optim.Adam(trainable_params)
 
+    """
     train_set, valid_set, test_set = get_genh_datasets(hp.train_clean, 
                                                        hp.train_noisy,
                                                        hp.valid_clean,
@@ -298,6 +315,19 @@ if __name__ == "__main__":
                                                        hp.test_noisy,
                                                        batch_size,
                                                        hparams=hp,
+                                                       num_workers=num_workers)
+    """
+    with open(hp.dtrans_cfg, 'r') as dtr_cfg_f:
+        dtr_cfg = json.load(dtr_cfg_f)
+        transform = config_distortions(**dtr_cfg)
+        print(transform)
+    train_set, valid_set, test_set = get_genh_datasets(hp.train_clean, 
+                                                       hp.valid_clean,
+                                                       hp.test_clean,
+                                                       batch_size,
+                                                       hparams=hp,
+                                                       transform=transform,
+                                                       cache=args.cache,
                                                        num_workers=num_workers)
 
     total_steps = 10_000_000 if force_train else hp.voc_total_steps
