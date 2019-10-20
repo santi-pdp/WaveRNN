@@ -188,6 +188,7 @@ if __name__ == "__main__":
     parser.add_argument('--samples', '-s', type=int, help='[int] number of utterances to generate')
     parser.add_argument('--target', '-t', type=int, help='[int] number of samples in each batch index')
     parser.add_argument('--overlap', '-o', type=int, help='[int] number of crossover samples')
+    parser.add_argument('--file_root', type=str, default=None)
     parser.add_argument('--file', '-f', type=str, nargs='+', help='[string/path] for '
                         'testing a wav outside dataset', default=None)
     parser.add_argument('--conversion_ref', '-k', type=str, help='[string/path] for testing a wav outside dataset')
@@ -279,9 +280,13 @@ if __name__ == "__main__":
             pase_id.eval()
             hp.pase_id = pase_id
         """
-        pase = PASEInjector(args.pase_cfg, args.pase_ckpt, False,
+        #pase = PASEInjector(args.pase_cfg, args.pase_ckpt, False,
+        #                    hp.num_mels, hp.pase_feats,
+        #                    paths.voc_checkpoints, global_mode=hp.global_pase)
+        pase = PASEInjector(hp.pase_cfg, hp.pase_ckpt, hp.pase_ft,
                             hp.num_mels, hp.pase_feats,
-                            paths.voc_checkpoints, global_mode=hp.global_pase)
+                            paths.voc_checkpoints, global_mode=hp.global_pase,
+                            stft_cfg=hp.stft_cfg, stft_ckpt=hp.stft_ckpt)
         #pase.load_pretrained(args.pase_ckpt, load_last=True, verbose=True)
         pase.to(device)
         hp.pase = pase
@@ -306,14 +311,20 @@ if __name__ == "__main__":
         if args.num_workers > 0:#and device == 'cpu':
             print('Using {} workers for parallel CPU '
                   'inference'.format(args.num_workers))
-            mpargs = [(model, f, save_path, batched, target, \
-                       overlap, hp, args.use_basename, device) for f in file]
+            mpargs = []
+            for f in file:
+                if args.file_root is not None:
+                    f = os.path.join(args.file_root, f)
+                mpargs.append((model, f, save_path, batched, target, overlap,
+                               hp, args.use_basename, device))
             with mp.Pool(args.num_workers) as pool:
                 for _ in tqdm.tqdm(pool.imap(gen_genh_from_file_mp_wrapper, mpargs),
                                    total=len(mpargs)):
                     pass
         else:
             for f in tqdm.tqdm(file, total=len(file)):
+                if args.file_root is not None:
+                    f = os.path.join(args.file_root, f)
                 #gen_from_file(model, f, paths.voc_output, batched, target, overlap,
                 #              pase_cntnt=pase_cntnt, pase_id=pase_id, 
                 #              conversion_ref=args.conversion_ref, device=device)
